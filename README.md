@@ -1,6 +1,6 @@
 Steps
 
-1. Download [dih client](https://dih.lxysg.com) 
+1. Download [dih client](https://dih.lxysg.com)    (CODE IS OPEN SOURCE FOR INSPECTION: https://github.com/ahigherdesire/dih-client)
 2. run .scripts add gold_dropper
 3. Copy the contents of the gold dropper.
 4. Set a home on hoppers/in front of water streams. this is where your bot will drop the raw gold
@@ -19,3 +19,4 @@ IMPORTANT!!
 
 --> best items to convert to: elytras, maces, golden apples (stable prices), armour sets, netherite ingots, ancient debris
 --> or gamble them away, idk
+
