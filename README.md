@@ -18,3 +18,4 @@ IMPORTANT!!
 
 
 --> best items to convert to: elytras, maces, golden apples (stable prices), armour sets, netherite ingots, ancient debris
+--> or gamble them away, idk
