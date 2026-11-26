@@ -11,3 +11,8 @@ Tell claude or chatgpt about the situation and tell it to fix the code while ref
 Tell it:
  - what the problem was
   
+IMPORTANT!!
+- This will get you banned if too suspicious
+- Try to convert your money to items and spread it around the server
+1 billion a day
+  watch out
