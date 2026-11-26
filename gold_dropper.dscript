@@ -1,0 +1,1063 @@
+// gold_dropper.dscript  (private build: reports to the alt dashboard at http://localhost:8777)
+// Fully autonomous gold mining from the chests above /home.
+//
+// Every home visit (and at the start) it sorts the whole inventory back into the chests, drops the
+// mined raw gold into the water stream, and leaves with exactly:
+//   1 pickaxe, 1 water bucket, 1 stack of golden carrots, and 33 raw gold (1 in each other slot),
+// so the only thing it can pick up while mining is more gold. Chests are told apart by what is in them;
+// items with no chest of their own go into the chest with an emerald in it.
+//
+// start -> /home -> sort + gear up -> /rtpmenu -> Overworld -> Badlands -> #mine gold_ore
+// Goes home (and does all of that again) when:
+//   - the pickaxe is worn out (fewer than MIN_DURABILITY uses): it goes into the emerald chest, a fresh one comes out of the pickaxe chest
+//   - golden carrots run low (fewer than LOW_CARROTS)
+//   - a player comes near, health is low, or hunger is low (no eating while mining)
+//   - the inventory is full of raw gold
+// Stops only when the chests can't supply a pickaxe, a water bucket or golden carrots.
+//
+// Run:  .scripts run gold_dropper    Stop: .scripts stop gold_dropper
+
+// ---- set these two -------------------------------------------------------
+const OVERWORLD_SLOT = 18;    // slot number of the Overworld button in /rtpmenu
+const BADLANDS_SLOT  = 20;    // slot number of the Badlands button
+// ---------------------------------------------------------------------------
+
+const HOME_COMMAND   = "/home";
+const ORE            = "gold_ore";
+const LOW_HEALTH     = 14;    // 20 = full health, 2 per heart: go home at 7 hearts, while the /home warm-up is still survivable (a death drops the pickaxe for good: no /back, 1 home)
+const LOW_HUNGER     = 8;     // 20 = full, 2 per drumstick: 8 = 4 drumsticks
+const SAFE_RADIUS    = 48;    // how close a player can get (blocks)
+// our own accounts never count as "player nearby": the alts often land on the same Badlands spot
+const OWN_ACCOUNTS   = ["bananaman591", "abcalculus", "nushkcm", "pixiedust3", "velvetbunnyuwu", "pinescafe", "happilyeverafter"];
+const MIN_DURABILITY = 20;    // a pickaxe with fewer uses left counts as worn out
+const CARROTS        = 64;    // golden carrots to carry out (one stack)
+const GOLD_SLOTS     = 33;    // raw gold carried out, 1 in each slot the gear doesn't use
+const LOW_CARROTS    = 5;     // fewer than this -> go home and refill
+const HOME_X         = -4203; // the /home spot: no mining within HOME_KEEP_OUT blocks of it
+const HOME_Z         = 13561;
+const HOME_KEEP_OUT  = 200;
+const CHEST_RADIUS   = 4;     // the chests above the /home spot (y27 and the bucket chests at y29), all within reach
+const MENU_TIMEOUT   = 100;   // ticks to wait for a menu (100 = 5 seconds)
+const STUCK_SECONDS  = 60;    // no movement and no new gold for this long while mining -> /rtpmenu again from where it is
+const STUCK          = "stuck";
+const FLEE           = "flee";    // a player nearby: teleport to a new spot
+const SLOW_EVERY     = 2000;  // ms between the slow checks while mining (health is checked every pass)
+const WATER_SECONDS  = 60;    // in water this long while mining -> /home and start over
+const GEM_COMMAND    = "/getgem";   // daily emerald: it goes into the emerald chest with the junk
+const GEM_EVERY      = 3600000;     // try at most once an hour (ms); the server refuses it until the next day
+
+// ---- dashboard bookkeeping
+let goldStored = 0;           // raw gold mined and already dropped at home this session
+let goldBase   = 0;           // raw gold carried right after the last gear-up (not mined)
+let holdAtHome = false;       // the dashboard's "Go home" button: stay home until "Mine" is pressed
+let lastGem    = 0;           // time() of the last /getgem try (0 = not yet this run)
+let lastHp     = 20;          // health at the last check, to spot hits
+let leftWithPickaxe = false;  // true from gearing up until the next time it is home: a pickaxe missing then was lost on the trip
+let lostPickaxes = 0;
+let lastSeenPos = "?";         // where the miner was at the last slow check, to say where it died
+let lastSeenAt = 0;
+let lastWhy = "nothing logged";   // what the last hit looked like
+let deaths     = 0;           // deaths this run (shown on the dashboard; the watcher on the PC counts them too)
+let lastHurtAt = 0;           // time() of the last "Hurt:" line (at most one every 2 s)
+
+function main() {
+    setState("starting");
+    goldBase = count("raw_gold");
+    reportGold();
+
+    if (OVERWORLD_SLOT < 0 || BADLANDS_SLOT < 0) {
+        error("Set OVERWORLD_SLOT and BADLANDS_SLOT at the top of the script first");
+    }
+    // Baritone must stop using a pickaxe exactly when the script counts it as worn (below MIN_DURABILITY)
+    baritone("set itemSaver true");
+    baritone("set itemSaverThreshold " + (MIN_DURABILITY - 1));   // Baritone skips tools with this many uses or fewer: it uses 20, stops at 19, and the script goes home
+    // a death drops the pickaxe where nothing can fetch it back: path around hostile mobs instead of through them
+    baritone("set avoidance true");
+    baritone("set mobAvoidanceRadius 8");
+    // Baritone never plans a water-bucket landing (the miners may not fall at all, see below)
+    baritone("set allowWaterBucketFall false");
+    // a Warden (Deep Dark, y -52 and lower) kills in one hit whatever the health: never mine below y -24 (minY -64 + 40)
+    baritone("set minYLevelWhileMining 40");
+    // An unplanned long fall (a ledge, ungenerated ground) kills a full-health bot and drops the pickaxe for good.
+    // The client's Clutch module drops the water bucket onto the ground below it, on game ticks (no frame rate needed).
+    command(".setting clutch mode Big Falls");
+    command(".setting clutch fall-height 6");
+    command(".setting clutch clutch-with Water");
+    command(".setting clutch air-window 100");
+    command(".toggle clutch on");
+    // The miners may not fall or bridge: no drop of more than one block, no placing blocks (no bridging, pillaring or
+    // scaffolding), no parkour jumps. The water bucket stays in the hotbar only as the Clutch module's backup for a fall
+    // nobody planned (e.g. a teleport that lands in the air). If Baritone finds no path that way the script re-teleports.
+    baritone("set maxFallHeightNoWater 1");
+    baritone("set maxFallHeightBucket 1");
+    baritone("set allowPlace false");
+    baritone("set allowParkour false");
+    baritone("set allowParkourPlace false");
+    baritone("set allowParkourAscend false");
+    baritone("set allowDiagonalDescend false");
+    baritone("set allowOvershootDiagonalDescend false");
+
+    setState("going home: gearing up to start");
+    goHome();
+    atHome();
+    while (true) {
+        waitForMineButton();                    // only if "Go home" was pressed on the dashboard
+        travelToBadlands();                     // /rtpmenu -> Overworld -> Badlands
+        let reason = goldMining();
+        let flees = 0;
+        // stuck for a minute, or a player around: new random spot right away, no trip home.
+        // Players 3 times in a row (or the /rtp cooldown keeps it next to one): go home instead.
+        while (reason == STUCK || (reason == FLEE && flees < 3)) {
+            if (reason == FLEE) {
+                flees = flees + 1;
+                setState("player nearby: re-teleporting");
+            } else {
+                log("Stuck for " + STUCK_SECONDS + "s - teleporting somewhere else");
+                setState("stuck: re-teleporting");
+            }
+            stopBaritone();
+            travelToBadlands();
+            reason = goldMining();
+        }
+        if (reason == FLEE) { reason = "players at 3 spots in a row"; }
+        log("Going home: " + reason);
+        setState("going home: " + reason);
+        goHome();
+        atHome();                               // eat + heal, drop gold, gear up
+    }
+}
+
+// ---------------------------------------------------------------- dashboard
+
+let lastState = "";
+function setState(text) {
+    dashboard("state", text);
+    if (text != lastState) { log("state: " + text); lastState = text; }
+}
+
+// every line starts with the alt's name: all the alts write into one shared log file
+function log(msg) {
+    print(playerName() + " | " + msg);
+}
+
+function pos() { return floor(x()) + "," + floor(y()) + "," + floor(z()); }
+
+// the whole inventory in one line: pickaxes with uses left, the rest as name x count (raw gold summed)
+function invSummary() {
+    let items = inventoryItems();
+    let uses = inventoryUses();
+    let out = "";
+    let others = [];
+    let i = 0;
+    while (i < 36) {
+        let it = items[i];
+        if (it != null && it != "raw_gold" && !isFood(it)) {
+            if (uses[i] >= 0) { out = out + "[" + (i + 1) + "]" + it + "(" + uses[i] + ") "; }
+            else { push(others, it); }
+        }
+        i = i + 1;
+    }
+    for (let o in others) { out = out + o + " "; }
+    let off = slotItem(45);
+    if (off != null) { out = out + "offhand:" + off + " "; }
+    return out + "| raw gold " + count("raw_gold") + ", food items " + foodCount() + " (" + foodItem() + "), free slots " + freeSlots()
+        + ", hp " + floor(health()) + ", food " + food() + " at " + pos();
+}
+
+// what it carries, checked every loop on a trip: any change to the gear (or an item it never picks up) is logged
+// with where it is and what is hurting it, so a lost pickaxe or bucket shows up the moment it goes
+let gearSeen = "";
+let lastBeat = 0;
+function gearKey() {
+    let k = "pickaxes " + pickaxeCount(1) + ", water buckets " + count("water_bucket") + ", buckets " + count("bucket")
+        + ", held " + heldItem();
+    let junk = 0;
+    for (let it in inventoryItems()) {
+        if (it != null && !isGear(it)) { junk = junk + 1; }
+    }
+    return k + ", other slots " + junk;
+}
+function noteGear(where) {
+    let k = gearKey();
+    if (k != gearSeen) {
+        if (gearSeen != "") { log("GEAR CHANGED (" + where + "): " + gearSeen + "  ->  " + k + " | " + invSummary() + " | " + hurtReport(8)); }
+        gearSeen = k;
+    }
+    if (time() - lastBeat > 60000) {
+        lastBeat = time();
+        log("heartbeat (" + where + "): " + invSummary() + " | baritone " + baritoneBusy() + " | " + hurtReport(8));
+    }
+}
+
+// gold mined this session = what was dropped + what was picked up since the last gear-up
+function reportGold() {
+    dashboard("gold", goldStored + max(0, count("raw_gold") - goldBase));
+}
+
+// The dashboard's buttons. "home" = go home after this check and wait, "mine" = carry on.
+function checkCommands() {
+    let c = dashboardCommand();
+    if (c == "home") { holdAtHome = true; }
+    if (c == "mine") { holdAtHome = false; }
+}
+
+function waitForMineButton() {
+    checkCommands();
+    if (!holdAtHome) { return; }
+    setState("at home (waiting for Mine)");
+    log("Waiting at home - press Mine on the dashboard to go back");
+    while (holdAtHome) {
+        wait(10);
+        checkCommands();
+    }
+    log("Mine pressed - heading back");
+}
+
+// ---------------------------------------------------------------- mining
+
+// Mines until something sends it home, then returns why.
+function goldMining() {
+    if (nearHome()) { return STUCK; }           // second guard: never start #mine near the base
+    let landed = strangerNearby();
+    if (landed != null) { log("Player " + landed + " here - teleporting away"); return FLEE; }
+    setState("mining");
+    equipPickaxe(MIN_DURABILITY);
+    baritone("mine " + ORE);                    // #mine gold_ore
+    // On a minimized client every game call waits for the next frame (10 fps: ~100 ms each), so a pass over
+    // every check takes ~3 s - too slow to leave before a mob or a fall kills it and the pickaxe drops for good.
+    // So each pass only reads health; the rest runs every SLOW_EVERY ms. (Creepers don't explode on Mineberry.)
+    let idleSince = 0;                          // time() Baritone went idle (0 = busy)
+    let idleAsked = false;
+    let stuckSince = time();                    // last time it moved 2+ blocks or picked up gold
+    let waterSince = 0;                         // time() it went into water (0 = not in water)
+    let drySince = time();
+    let lastSlow = 0;
+    let sx = x(); let sy = y(); let sz = z(); let sGold = count("raw_gold");
+    while (true) {
+        // ---- fast: every pass
+        let hp = health();
+        if (hp <= 0) {
+            log("DIED near " + lastSeenPos + " (last seen " + floor((time() - lastSeenAt) / 1000) + " s ago), hp was " + lastHp
+                + " | last hit: " + lastWhy + " | now: " + hurtReport(8));
+            return died();
+        }
+        if (hp < lastHp - 0.5 || hp <= LOW_HEALTH) {
+            let why = hurtReport(8);
+            lastWhy = why;
+            if (hp < lastHp - 0.5 && time() - lastHurtAt > 2000) { log("Hurt " + lastHp + " -> " + hp + ": " + why); lastHurtAt = time(); }
+            if (hp <= LOW_HEALTH) {
+                stopBaritone();                 // stop digging further into whatever is hurting it
+                lastHp = hp;
+                log("Low health " + hp + " - " + why);
+                return "low health (" + hp + ")";
+            }
+        }
+        lastHp = hp;
+
+        // a Warden hits for 30 and its sonic boom for 10 through armor: no health check helps once it is close
+        let around = hurtReport(24);
+        if (contains(around, "warden")) {
+            stopBaritone();
+            log("Warden near - going home: " + around);
+            return "warden near";
+        }
+
+        // ---- slow: every SLOW_EVERY ms
+        if (time() - lastSlow >= SLOW_EVERY) {
+            lastSlow = time();
+            lastSeenPos = pos(); lastSeenAt = time();
+            reportGold();
+            checkCommands();
+            if (holdAtHome) { return "sent home from the dashboard"; }
+            if (nearHome()) { stopBaritone(); return STUCK; }
+            let stranger = strangerNearby();
+            if (stranger != null) { stopBaritone(); log("Player " + stranger + " nearby - teleporting away"); return FLEE; }
+            noteGear("mining");
+            if (inventoryFull("raw_gold")) { return "inventory full"; }
+            if (pickaxeCount(MIN_DURABILITY) == 0) { return "pickaxe worn out"; }
+            if (foodCount() < LOW_CARROTS) { return "food low (" + foodCount() + " " + foodItem() + ")"; }
+            if (food() <= LOW_HUNGER) { return "hungry (" + food() + "/20)"; }   // eating heals, so only at home
+            // in water for a minute (Baritone stuck swimming): start over from /home, like restarting the script
+            // swimming at the surface bobs the feet in and out of the water: reset only after 5 dry seconds in a row
+            if (inWater()) {
+                if (waterSince == 0) { waterSince = time(); }
+                drySince = 0;
+            } else {
+                if (drySince == 0) { drySince = time(); }
+                if (time() - drySince >= 5000) { waterSince = 0; }
+            }
+            if (waterSince > 0 && time() - waterSince >= WATER_SECONDS * 1000) { stopBaritone(); return "stuck in water for " + WATER_SECONDS + "s"; }
+            if (contains(heldItem(), "pickaxe") && heldDurability() < MIN_DURABILITY) {
+                equipPickaxe(MIN_DURABILITY);   // a second good pickaxe is carried: use it
+            }
+            // stuck: still within 2 blocks of where it was, and no new gold, for STUCK_SECONDS
+            let px = x(); let py = y(); let pz = z(); let g = count("raw_gold");
+            if (abs(px - sx) > 2 || abs(py - sy) > 2 || abs(pz - sz) > 2 || g != sGold) {
+                sx = px; sy = py; sz = pz; sGold = g;
+                stuckSince = time();
+            } else {
+                if (time() - stuckSince >= STUCK_SECONDS * 1000) { return STUCK; }
+            }
+            // Baritone can give up on #mine (no gold it can reach) while the script still says "mining"
+            if (baritoneBusy()) {
+                idleSince = 0; idleAsked = false;
+            } else {
+                if (idleSince == 0) { idleSince = time(); }
+                if (!idleAsked && time() - idleSince >= 5000) {   // 5 seconds idle -> ask again
+                    idleAsked = true;
+                    log("Baritone stopped mining - restarting #mine " + ORE);
+                    baritone("mine " + ORE);
+                }
+                if (time() - idleSince >= 60000) {                 // still idle after a minute -> new spot
+                    log("Baritone found no reachable gold here");
+                    return STUCK;
+                }
+            }
+        }
+        wait(1);
+    }
+}
+
+// in water (still or flowing): a water block where its feet are, or right under them (floating at the surface)
+function inWater() {
+    let fx = floor(x()); let fy = floor(y()); let fz = floor(z());
+    for (let b in findBlocks("water", 2)) {
+        if (b[0] == fx && b[2] == fz && (b[1] == fy || b[1] == fy - 1)) { return true; }
+    }
+    return false;
+}
+
+function goHome() {
+    stopBaritone();                             // stop #mine
+    log("/home from " + pos() + " (hp " + floor(health()) + ")");
+    // after a reconnect it stands at the world spawn (the lobby): /home does nothing there, /s1 comes first
+    if (abs(x()) < 64 && abs(z()) < 64) {
+        log("At the world spawn - going to s1 first");
+        command("/s1");
+        waitSeconds(12);
+    }
+    let fx = x(); let fz = z();
+    let t0 = time();
+    command(HOME_COMMAND);
+    let lastSent = time();
+    let resends = 0;
+    // Mineberry has no /home warm-up (measured: moved 0.3 s after the command): go on the moment it has moved.
+    // Once in a while the server ignores it (nushkcm sat 8 s under skeleton fire at 08:42, then died): ask again.
+    // a teleport moves it far: knockback or a last step of Baritone moves it a few blocks and must not count (pixiedust3 died that way)
+    while (abs(x() - fx) + abs(z() - fz) < 60 && !(abs(x() - HOME_X) < 6 && abs(z() - HOME_Z) < 6) && time() - t0 < 12000) {
+        if (time() - lastSent > 1200 && resends < 8) {
+            resends = resends + 1;
+            log("/home did not go through after " + (time() - t0) + " ms - sending it again (" + resends + ")");
+            command(HOME_COMMAND);
+            lastSent = time();
+        }
+        wait(1);
+    }
+    log("/home took " + (time() - t0) + " ms");
+    let tries = 0;                              // a slow teleport: wait until the home chests are in sight
+    while (len(findBlocks("chest", CHEST_RADIUS)) == 0 && tries < 15) {
+        waitSeconds(1);
+        tries = tries + 1;
+    }
+    log("after /home: at " + pos() + ", " + len(findBlocks("chest", CHEST_RADIUS)) + " chests in reach");
+}
+
+// ---------------------------------------------------------------- at home
+//
+// Every visit home ends with exactly this inventory:
+//   1 pickaxe, 1 water bucket, 1 stack of golden carrots (in the hotbar), and 33 raw gold, 1 in each other slot.
+// To get there it sorts everything else back into the chests above /home, by what each chest holds:
+//   worn pickaxes -> the emerald chest, with the junk (fewer than MIN_DURABILITY uses left)
+//   pickaxes      -> the chest with pickaxes (good spares; it keeps its best one)
+//   golden carrots-> the chest with golden carrots (then takes one full stack back)
+//   buckets       -> the chest with water buckets (empty ones and spares)
+//   anything else -> the chest with an emerald in it (the emerald stays there)
+//   raw gold      -> dropped into the water stream at /home, keeping 33
+// Each chest and the inventory are read in one go (chestItems(), inventoryItems()): reading slot by
+// slot waits for a frame each time, which takes minutes on a minimized client.
+
+let chestList = [];           // one entry per chest (double chests once), closest first
+let chestRoles = [];          // what each of them holds, filled in on the first look
+
+function atHome() {
+    log("home at " + pos() + " - carrying: " + invSummary());
+    if (leftWithPickaxe && pickaxeCount(1) == 0) {
+        lostPickaxes = lostPickaxes + 1;
+        dashboard("lost pickaxes", "" + lostPickaxes);
+        log("LOST PICKAXE on the trip (came home without it) at " + x() + ", " + y() + ", " + z() + " - " + hurtReport(8));
+    }
+    leftWithPickaxe = false;
+    setState("at home (sorting inventory)");
+    closeGui();
+    claimGem();                                 // before restock: the emerald is sorted into the emerald chest
+    goldStored = goldStored + max(0, count("raw_gold") - goldBase);
+    restock();
+    goldBase = count("raw_gold");               // the 33 it carries out are not mined gold
+    reportGold();
+
+    setState("at home (healing)");
+    eatUntilFull();
+    if (foodCount() < CARROTS) { topUpCarrots(); }
+    goldBase = count("raw_gold");
+    checkGear();
+}
+
+// /getgem gives one emerald a day; restock's junk sort then puts it in the emerald chest
+function claimGem() {
+    if (lastGem != 0 && time() - lastGem < GEM_EVERY) { return; }
+    lastGem = time();
+    let before = count("emerald");
+    command(GEM_COMMAND);
+    waitSeconds(3);
+    closeGui();
+    if (count("emerald") > before) { log("Got the daily emerald from " + GEM_COMMAND); }
+}
+
+function restock() {
+    findChests();
+
+    // round 1: look in every chest once, put away what belongs there
+    let i = 0;
+    while (i < len(chestList)) {
+        if (openChest(chestList[i])) {
+            let role = chestRole();
+            if (role == "empty" && (chestRoles[i] == "pickaxes" || isPickaxeChest(chestList[i]))) { role = "pickaxes"; }   // emptied by the alts: still the pickaxe chest
+            chestRoles[i] = role;
+            if (role == "junk") { depositJunk(); depositWornPickaxes(); }
+            if (role == "pickaxes") { depositSparePickaxes(); }
+            if (role == "buckets") { depositSpareBuckets(); }
+            if (role == "carrots") { deposit("golden_carrot"); deposit("cooked_beef"); }
+            closeGui();
+            wait(4);
+        }
+        i = i + 1;
+    }
+    log("Chests: " + str(chestRoles));
+
+    // raw gold: into the water stream, 1 left in each of 33 slots. Only after round 1, so the terracotta and
+    // other blocks picked up while mining are already in the emerald chest and can't go in the stream with it.
+    // /home right before the drop so the alt faces the stream (opening chests turns it to look up)
+    if (count("raw_gold") > goldSlots()) {
+        closeGui();
+        command(HOME_COMMAND);
+        waitSeconds(1);                         // the teleport takes ~0.3 s; this one only turns it to face the stream
+        let dropped = dropExcept("raw_gold", GOLD_SLOTS);
+        log("Dropped " + dropped + " raw gold into the stream");
+    }
+
+
+    // round 2: take the gear from the chest that holds it
+    if (pickaxeNeeded()) { visit("pickaxes"); }
+    if (bucketNeeded()) { visit("buckets"); }
+    if (bucketNeeded()) { refillBucket(); }    // no water buckets left: fill an empty one at the pool
+    if (foodCount() < CARROTS) { makeRoomForFood(); visit("carrots"); }
+
+    // round 3: 1 raw gold in each slot that is still empty, up to 33
+    if (count("raw_gold") < GOLD_SLOTS && freeSlots() > 0) { visit("gold"); }
+    foodToHotbar();
+}
+
+// A free slot at home can be filled by something that drifts by (a pickaxe or gold in the water stream): then the
+// stack of food has nowhere to go and the shift-click silently does nothing. Put the spare away first.
+function makeRoomForFood() {
+    if (freeSlots() > 0) { return; }
+    log("No free slot for the food - putting spare things away: " + invSummary());
+    if (pickaxeCount(MIN_DURABILITY) > 1) { returnSparePickaxes(); }
+    if (freeSlots() == 0 && hasJunk()) { visit("junk"); }
+    if (freeSlots() == 0 && count("raw_gold") > goldSlots()) {
+        closeGui();
+        command(HOME_COMMAND);
+        waitSeconds(1);
+        dropExcept("raw_gold", GOLD_SLOTS);
+    }
+    log("Free slots now: " + freeSlots());
+}
+
+// open the pickaxe chest and put every good pickaxe but the best one back
+function returnSparePickaxes() {
+    let i = 0;
+    while (i < len(chestList)) {
+        if (chestRoles[i] == "pickaxes" && openChest(chestList[i])) {
+            depositSparePickaxes();
+            closeGui();
+            wait(4);
+            return;
+        }
+        i = i + 1;
+    }
+    log("No pickaxe chest found to put the spare pickaxe in");
+}
+
+// open the chests that hold role, one after another, until what is needed from them has been taken
+// (several chests can share a role, e.g. one bucket chest with only empties and one full of water buckets)
+function visit(role) {
+    let found = false;
+    let i = 0;
+    while (i < len(chestList)) {
+        if (chestRoles[i] == role && openChest(chestList[i])) {
+            found = true;
+            log("opened the " + role + " chest at " + chestList[i][0] + "," + chestList[i][1] + "," + chestList[i][2] + ": " + chestSummary());
+            if (role == "junk") { depositJunk(); depositWornPickaxes(); }
+            if (role == "pickaxes") { takeBestPickaxe(); }
+            if (role == "buckets") { takeOne("water_bucket"); }
+            if (role == "carrots") { takeCarrotStack(); }
+            if (role == "gold") { fillSlots("raw_gold", min(GOLD_SLOTS - count("raw_gold"), freeSlots())); }
+            closeGui();
+            wait(4);
+            if (visitDone(role)) { return; }
+        }
+        i = i + 1;
+    }
+    if (!found) { log("No chest with " + role + " found above home"); }
+}
+
+function visitDone(role) {
+    if (role == "pickaxes") { return !pickaxeNeeded(); }
+    if (role == "buckets") { return !bucketNeeded(); }
+    if (role == "carrots") { return foodCount() >= LOW_CARROTS; }
+    if (role == "gold") { return count("raw_gold") >= GOLD_SLOTS || freeSlots() == 0; }
+    return true;
+}
+
+// the chests above /home, each double chest once (its two halves sit next to each other)
+function findChests() {
+    if (len(chestList) > 0) { return; }
+    for (let c in findBlocks("chest", CHEST_RADIUS)) {
+        let half = false;
+        for (let k in chestList) {
+            if (k[1] == c[1] && abs(k[0] - c[0]) + abs(k[2] - c[2]) == 1) { half = true; }
+        }
+        if (!half) { push(chestList, c); if (isPickaxeChest(c)) { push(chestRoles, "pickaxes"); } else { push(chestRoles, ""); } }
+    }
+    if (len(chestList) == 0) { error("No chest within " + CHEST_RADIUS + " blocks of home"); }
+}
+
+// carrots eaten while healing: swap the stack for a full one
+function topUpCarrots() {
+    let i = 0;
+    while (i < len(chestList)) {
+        if (chestRoles[i] == "carrots" && openChest(chestList[i])) {
+            deposit("golden_carrot");
+            deposit("cooked_beef");
+            takeCarrotStack();
+            closeGui();
+            wait(4);
+            foodToHotbar();
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+function checkGear() {
+    // a chest that didn't open (another alt in it, a slow server) looks like an empty one: try again before giving up
+    // Several alts often come home together and queue for the same chest, so keep trying for about 2 minutes.
+    // Not at home (died, or /home didn't go through)? Then the chests aren't in reach: /home again first.
+    let tries = 0;
+    while (tries < 8 && (pickaxeNeeded() || bucketNeeded() || foodCount() < LOW_CARROTS || hasWornPickaxe() || hasJunk())) {
+        log("Gear missing - looking in the chests again");
+        waitSeconds(3 + tries * 2);
+        if (len(findBlocks("chest", CHEST_RADIUS)) == 0) {
+            log("No chests in reach - going home first");
+            closeGui();
+            goHome();
+        }
+        // a worn pickaxe the emerald chest didn't take (a click the server dropped) fills the slot the carrots need
+        if (hasWornPickaxe() || hasJunk()) { visit("junk"); }
+        if (pickaxeNeeded()) { visit("pickaxes"); }
+        if (bucketNeeded()) { visit("buckets"); }
+        if (bucketNeeded()) { refillBucket(); }
+        if (foodCount() < LOW_CARROTS) { makeRoomForFood(); visit("carrots"); foodToHotbar(); }
+        tries = tries + 1;
+    }
+    let missing = "";
+    if (pickaxeNeeded()) { missing = missing + "pickaxe, "; }
+    if (bucketNeeded()) { missing = missing + "water bucket, "; }
+    if (foodCount() < LOW_CARROTS) {
+        if (freeSlots() == 0) { missing = missing + "food (no free inventory slot to take golden carrots or steak), "; }
+        else { missing = missing + "food (golden carrots or steak), "; }
+    }
+    if ((hasWornPickaxe() || hasJunk()) && freeSlots() == 0) {
+        dashboard("reason", "the emerald chest is full - empty it so worn pickaxes and junk fit");
+        error("The emerald chest is full: junk or a worn pickaxe can't go in, so there's no slot for golden carrots. Empty the emerald chest.");
+    }
+    // only the pickaxe is missing: the mender brings mended ones back, so wait for it as long as it takes
+    let waited = 0;
+    while (missing == "pickaxe, ") {
+        setState("at home (waiting for a mended pickaxe, " + waited + " min)");
+        log("The pickaxe chest is empty - waiting for the mender, checking again in 2 minutes");
+        waitSeconds(120);
+        waited = waited + 2;
+        relearnRoles();
+        visit("pickaxes");
+        if (!pickaxeNeeded()) { missing = ""; }
+    }
+    if (missing != "") {
+        dashboard("reason", "chests at home are out of: " + missing);
+        error("Can't gear up - the chests at home are out of: " + missing);
+    }
+    equipPickaxe(MIN_DURABILITY);
+    leftWithPickaxe = true;
+    log("leaving with: " + invSummary());
+    gearSeen = gearKey();
+    dashboard("pickaxes", heldDurability() + " uses carried");
+    log("Geared up: pickaxe " + heldDurability() + " uses, " + foodCount() + " " + foodItem() + ", water bucket, "
+        + count("raw_gold") + " raw gold in " + goldSlots() + " slots");
+    if (count("raw_gold") < GOLD_SLOTS) { log("Warning: only " + count("raw_gold") + " raw gold - the gold chest is empty"); }
+}
+
+function eatUntilFull() {
+    while (!inWorld()) { wait(20); }                       // a reconnect makes eat() fail with "Not in a world"
+    let t0 = time();
+    let tries = 0;
+    while (health() < maxHealth() || food() < 20) {
+        while (!inWorld()) { wait(20); }
+        // eating that never fills the bar (the server cancels it) must not hold the miner at home for good
+        if (time() - t0 > 60000) {
+            log("Healing is taking too long (hp " + health() + ", food " + food() + ", " + tries + " tries) - going on");
+            return;
+        }
+        if (health() >= maxHealth() && food() >= 14) { return; }   // healthy and fed enough to go out
+        if (food() < 20) {
+            tries = tries + 1;
+            if (!eat()) {
+                log("Out of food");
+                if (health() >= maxHealth() || food() < 18) { return; }   // nothing to eat and hunger too low to heal
+                waitSeconds(2);
+            }
+        } else {
+            waitSeconds(1);                                // hunger full -> health regenerates
+        }
+    }
+}
+
+// ---- chests (all read in one go)
+
+// what the open chest is for, from what is in it ("" if it can't tell)
+function chestRole() {
+    let items = chestItems();
+    if (contains(items, "emerald")) { return "junk"; }   // worn pickaxes and all junk go here
+    if (contains(items, "glass_pane")) { return "pickaxes"; }   // the glass pane marks the pickaxe chest (it never leaves it)
+    for (let it in items) {
+        if (it != null && contains(it, "pickaxe")) { return "pickaxes"; }
+    }
+    if (contains(items, "water_bucket") || contains(items, "bucket")) { return "buckets"; }
+    if (contains(items, "golden_carrot") || contains(items, "cooked_beef")) { return "carrots"; }
+    if (contains(items, "raw_gold")) { return "gold"; }
+    for (let it in items) {
+        if (it != null) { return ""; }
+    }
+    return "empty";
+}
+
+// look in every chest again (the mender may have filled the empty pickaxe chest since)
+function relearnRoles() {
+    let i = 0;
+    while (i < len(chestList)) {
+        if (chestRoles[i] != "pickaxes" && openChest(chestList[i])) {
+            let role = chestRole();
+            if (role != "empty" || chestRoles[i] == "") { chestRoles[i] = role; }
+            closeGui();
+            wait(4);
+        }
+        i = i + 1;
+    }
+}
+
+// open the chest at c = [x, y, z] (they are all within reach); one retry for a slow server
+function openChest(c) {
+    if (openBlock(c[0], c[1], c[2])) { wait(6); return true; }
+    wait(10);
+    if (openBlock(c[0], c[1], c[2])) { wait(6); return true; }
+    return false;
+}
+
+function isGear(item) {
+    return item == "raw_gold" || item == "golden_carrot" || item == "cooked_beef" || item == "water_bucket" || item == "bucket" || contains(item, "pickaxe");
+}
+
+// worn out, or too weak for gold ore (it needs iron or better): either way it goes to the emerald chest
+function isWorn(item, uses) {
+    if (!contains(item, "pickaxe")) { return false; }
+    if (item == "wooden_pickaxe" || item == "stone_pickaxe" || item == "golden_pickaxe") { return true; }
+    return uses >= 0 && uses < MIN_DURABILITY;
+}
+
+function hasWornPickaxe() {
+    let items = inventoryItems();
+    let uses = inventoryUses();
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && isWorn(items[i], uses[i])) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// with the emerald chest open: pickaxes with fewer than MIN_DURABILITY uses left
+function depositWornPickaxes() {
+    let items = inventoryItems();
+    let uses = inventoryUses();
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && isWorn(items[i], uses[i])) {
+            log("Returning worn " + items[i] + " (" + uses[i] + " uses left)");
+            clickInventory(i + 1, 0, true);
+            wait(2);
+        }
+        i = i + 1;
+    }
+}
+
+// with the emerald chest open: everything that has no chest of its own
+function depositJunk() {
+    let items = inventoryItems();
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && !isGear(items[i])) {
+            log("Putting away " + items[i]);
+            clickInventory(i + 1, 0, true);
+            wait(2);
+        }
+        i = i + 1;
+    }
+}
+
+// with the pickaxe chest open: good pickaxes beyond the best one go back (worn ones go to the emerald chest)
+function depositSparePickaxes() {
+    let items = inventoryItems();
+    let uses = inventoryUses();
+    let keep = -1;
+    let keepUses = MIN_DURABILITY - 1;
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && contains(items[i], "pickaxe") && !isWorn(items[i], uses[i])) {
+            let u = uses[i];
+            if (u < 0) { u = 100000; }
+            if (u > keepUses) { keep = i; keepUses = u; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 36) {
+        if (items[i] != null && contains(items[i], "pickaxe") && i != keep && !isWorn(items[i], uses[i])) {
+            log("Returning spare " + items[i] + " (" + uses[i] + " uses left) to the pickaxe chest");
+            clickInventory(i + 1, 0, true);
+            wait(2);
+        }
+        i = i + 1;
+    }
+}
+
+// with the bucket chest open: empty buckets and all but one water bucket go back
+function depositSpareBuckets() {
+    let items = inventoryItems();
+    let kept = false;
+    let i = 0;
+    while (i < 36) {
+        if (items[i] == "bucket") { clickInventory(i + 1, 0, true); wait(2); }
+        if (items[i] == "water_bucket") {
+            if (kept) { clickInventory(i + 1, 0, true); wait(2); }
+            kept = true;
+        }
+        i = i + 1;
+    }
+}
+
+// The bucket chests have only empties left: take one and fill it at the water pool next to /home.
+// Only from a source with 2+ source blocks beside it (the 2x2 pool), which refills at once, so the
+// water stream that carries the gold is never touched.
+function refillBucket() {
+    if (!contains(inventoryItems(), "bucket")) {
+        let i = 0;
+        while (i < len(chestList) && !contains(inventoryItems(), "bucket")) {
+            if (chestRoles[i] == "buckets" && openChest(chestList[i])) {
+                takeOne("bucket");
+                closeGui();
+                wait(4);
+            }
+            i = i + 1;
+        }
+    }
+    if (!contains(inventoryItems(), "bucket")) { log("No empty bucket in the bucket chests to fill"); return; }
+    closeGui();
+    putInHotbar("bucket");
+    // fillBucket only scoops a block the look ray reaches first, so try each pool block until one is in clear view
+    let tried = 0;
+    for (let b in findBlocks("water", 6)) {
+        if (isPoolSource(b)) {
+            tried = tried + 1;
+            if (fillBucket(b[0], b[1], b[2])) {
+                log("Filled a water bucket at the pool " + str(b) + " from " + pos());
+                returnEmptyBuckets();
+                return;
+            }
+            log("pool block " + str(b) + " not fillable from " + pos());
+        }
+    }
+    if (tried == 0) { log("No refilling water source in reach"); }
+    else {
+        log("Couldn't fill the bucket from " + pos() + ": none of the " + tried + " pool blocks is in clear view"
+            + " (the wall at x -4204 between /home and the pool is in the way: open -4204,25,13561 or put water buckets in the bucket chest)");
+    }
+}
+
+// a shift-click takes a whole stack of empties: put the ones left over after filling back, so their slot is free for food
+function returnEmptyBuckets() {
+    let i = 0;
+    while (i < len(chestList) && contains(inventoryItems(), "bucket")) {
+        if (chestRoles[i] == "buckets" && openChest(chestList[i])) {
+            depositSpareBuckets();
+            closeGui();
+            wait(4);
+        }
+        i = i + 1;
+    }
+    if (contains(inventoryItems(), "bucket")) { log("couldn't put the spare empty buckets back"); }
+}
+
+// a still source with 2+ sources beside it: it refills at once after a scoop
+function isPoolSource(b) {
+    if (!isWaterSource(b[0], b[1], b[2])) { return false; }
+    let n = 0;
+    if (isWaterSource(b[0] + 1, b[1], b[2])) { n = n + 1; }
+    if (isWaterSource(b[0] - 1, b[1], b[2])) { n = n + 1; }
+    if (isWaterSource(b[0], b[1], b[2] + 1)) { n = n + 1; }
+    if (isWaterSource(b[0], b[1], b[2] - 1)) { n = n + 1; }
+    return n >= 2;
+}
+
+// dead: wait for the respawn, then main() goes /home and gears up again (the pickaxe and gold are lost)
+function died() {
+    stopBaritone();
+    deaths = deaths + 1;
+    dashboard("deaths", "" + deaths);
+    setState("died - waiting to respawn");
+    let t = 0;
+    while (t < 60 && (!inWorld() || health() <= 0)) { waitSeconds(1); t = t + 1; }
+    waitSeconds(3);
+    lastHp = health();
+    return "died";
+}
+
+// health went down since the last check: log what is around (the server sends no death messages)
+function noteHurt() {
+    let hp = health();
+    if (hp < lastHp - 0.5 && time() - lastHurtAt > 2000) {
+        log("Hurt " + lastHp + " -> " + hp + ": " + hurtReport(8));
+        lastHurtAt = time();
+    }
+    lastHp = hp;
+}
+
+// the closest player within SAFE_RADIUS that isn't one of our own accounts, or null
+function strangerNearby() {
+    for (let name in playersNearby(SAFE_RADIUS)) {
+        if (!contains(OWN_ACCOUNTS, lower(name))) { return name; }
+    }
+    return null;
+}
+
+// shift-click one of item out of the open chest
+function takeOne(item) {
+    let items = chestItems();
+    let i = 0;
+    while (i < len(items)) {
+        if (items[i] == item) { clickSlot(i, 0, true); wait(3); return; }
+        i = i + 1;
+    }
+}
+
+// the pickaxe in the open chest with the most uses left (a brand-new one if there is one)
+function takeBestPickaxe() {
+    let items = chestItems();
+    let uses = chestUses();
+    let best = -1;
+    let bestUses = MIN_DURABILITY - 1;
+    let i = 0;
+    while (i < len(items) && i < len(uses)) {     // the chest can close between the two reads
+        if (items[i] != null && contains(items[i], "pickaxe") && !isWorn(items[i], uses[i])) {
+            let u = uses[i];
+            if (u < 0) { u = 100000; }          // unbreakable
+            if (u > bestUses) { best = i; bestUses = u; }
+        }
+        i = i + 1;
+    }
+    if (best < 0) { log("no usable pickaxe in the pickaxe chest"); return; }
+    log("taking " + items[best] + " (" + bestUses + " uses) from chest slot " + best);
+    clickSlot(best, 0, true);
+    wait(3);
+    log("now carrying " + pickaxeCount(1) + " pickaxe(s)");
+}
+
+// the open chest in one line: name x count, pickaxes with their uses
+function chestSummary() {
+    let items = chestItems();
+    let counts = chestCounts();
+    let uses = chestUses();
+    let names = [];
+    let totals = [];
+    let picks = "";
+    let i = 0;
+    while (i < len(items) && i < len(counts) && i < len(uses)) {
+        let it = items[i];
+        if (it != null) {
+            if (contains(it, "pickaxe")) { picks = picks + it + "(" + uses[i] + ") "; }
+            else {
+                let k = 0;
+                let hit = -1;
+                while (k < len(names)) { if (names[k] == it) { hit = k; } k = k + 1; }
+                if (hit < 0) { push(names, it); push(totals, counts[i]); }
+                else { totals[hit] = totals[hit] + counts[i]; }
+            }
+        }
+        i = i + 1;
+    }
+    let out = picks;
+    let j = 0;
+    while (j < len(names)) { out = out + names[j] + " x" + totals[j] + " "; j = j + 1; }
+    if (out == "") { return "empty"; }
+    return out;
+}
+
+// with the carrot chest open (the alt's own food already put back): exactly one stack of food.
+// The chest holds golden carrots and steak: take the biggest single stack, golden carrots when it's a tie.
+function takeCarrotStack() {
+    let items = chestItems();
+    let counts = chestCounts();
+    let best = -1;
+    let bestN = 0;
+    let i = 0;
+    while (i < len(items) && i < len(counts)) {   // the chest can close between the two reads
+        if (items[i] != null && isFood(items[i])) {
+            let n = counts[i];
+            if (items[i] == "golden_carrot") { n = n + 0.5; }
+            if (n > bestN) { best = i; bestN = n; }
+        }
+        i = i + 1;
+    }
+    if (best < 0) { log("no golden carrots or steak left in the carrot chest"); return; }
+    clickSlot(best, 0, true);
+    wait(3);
+    log("took " + items[best] + " x" + counts[best] + " from the carrot chest, now carrying " + foodCount() + " " + foodItem());
+}
+
+// ---- inventory
+
+// carrying blocks picked up while mining (cobblestone, tuff, ...) that belong in the emerald chest
+function hasJunk() {
+    for (let it in inventoryItems()) {
+        if (it != null && !isGear(it)) { return true; }
+    }
+    return false;
+}
+
+function pickaxeNeeded() { return pickaxeCount(MIN_DURABILITY) == 0; }
+function bucketNeeded()  { return !hasItem("water_bucket"); }
+
+// food: golden carrots or steak (both kept in the carrot chest), one stack of either
+function isFood(item)    { return item == "golden_carrot" || item == "cooked_beef"; }
+function foodCount()     { return count("golden_carrot") + count("cooked_beef"); }
+function foodItem() {
+    if (count("golden_carrot") >= count("cooked_beef")) { return "golden_carrot"; }
+    return "cooked_beef";
+}
+function foodToHotbar()  { putInHotbar("golden_carrot"); putInHotbar("cooked_beef"); }
+
+function goldSlots() {
+    let n = 0;
+    for (let it in inventoryItems()) {
+        if (it == "raw_gold") { n = n + 1; }
+    }
+    return n;
+}
+
+// move item into the hotbar (swapping with gold there) so eat() can reach it
+function putInHotbar(item) {
+    let inv = inventoryItems();
+    let i = 0;
+    while (i < 9) {
+        if (inv[i] == item) { return; }
+        i = i + 1;
+    }
+    let from = 9;
+    while (from < 36 && inv[from] != item) { from = from + 1; }
+    if (from >= 36) { return; }
+    let to = 8;                                 // a hotbar slot holding gold (or empty), not the pickaxe or bucket
+    while (to >= 0 && inv[to] != null && inv[to] != "raw_gold") { to = to - 1; }
+    if (to < 0) { return; }
+    clickInventory(from + 1, 0);                // pick up the carrots
+    wait(2);
+    clickInventory(to + 1, 0);                  // put them down, pick up what was there
+    wait(2);
+    clickInventory(from + 1, 0);                // put that back where the carrots were
+    wait(2);
+}
+
+// ---------------------------------------------------------------- teleport
+
+// Never mine near home: Baritone would dig up the base. A teleport that didn't go through (cooldown, a menu
+// click the server missed) leaves the alt standing at /home, so check it really left, and try again if not.
+function travelToBadlands() {
+    let tries = 0;
+    while (true) {
+        rtpToBadlands();
+        if (!nearHome()) { return; }
+        tries = tries + 1;
+        if (tries >= 5) {
+            dashboard("reason", "the Badlands teleport didn't work 5 times in a row");
+            error("Still at home after 5 Badlands teleports - not mining here");
+        }
+        log("The teleport didn't happen (still at home) - trying again in 30s");
+        setState("at home (teleport failed, retrying)");
+        closeGui();
+        waitSeconds(30);                        // the /rtp cooldown
+    }
+}
+
+function nearHome() {
+    return abs(x() - HOME_X) < HOME_KEEP_OUT && abs(z() - HOME_Z) < HOME_KEEP_OUT;
+}
+
+function rtpToBadlands() {
+    setState("travelling (rtp to badlands)");
+    command("/rtpmenu");
+    if (!waitForGui(MENU_TIMEOUT)) {
+        log("/rtpmenu did not open - trying again");   // a slow server: travelToBadlands retries (up to 5 times)
+        return;
+    }
+    wait(5);                                    // let the menu fill in
+    log("Clicking Overworld: slot " + OVERWORLD_SLOT + " (" + slotName(OVERWORLD_SLOT) + ")");
+    clickSlot(OVERWORLD_SLOT);
+
+    wait(10);                                   // the Badlands menu opens or replaces this one
+    if (!waitForGui(MENU_TIMEOUT)) {
+        log("The biome menu did not open after clicking Overworld - trying again");   // travelToBadlands retries
+        closeGui();
+        return;
+    }
+    wait(5);
+    log("Clicking Badlands: slot " + BADLANDS_SLOT + " (" + slotName(BADLANDS_SLOT) + ")");
+    let sx = x(); let sz = z();
+    clickSlot(BADLANDS_SLOT);
+
+    // wait for the teleport to land (up to 10s), then up to 2s for players to show up - no blind 8s wait
+    let t = 0;
+    while (t < 40 && abs(x() - sx) < 30 && abs(z() - sz) < 30) { wait(5); t = t + 1; }
+    log("teleport landed at " + pos() + " (" + dimension() + ")");
+    t = 0;
+    while (t < 8) {
+        if (strangerNearby() != null) { return; }   // goldMining sees them first thing and teleports away
+        wait(5);
+        t = t + 1;
+    }
+}
+
+// runs whenever the script stops
+function onStop() {
+    stopBaritone();
+    log("script stopping at " + pos() + " - carrying: " + invSummary());
+}
+
+// The pickaxe chest is the double chest at -4204/-4203, 27, 13562. Empty, nothing else marks it, so its place does.
+function isPickaxeChest(c) { return c[1] == 27 && c[2] == 13562 && (c[0] == -4204 || c[0] == -4203); }
