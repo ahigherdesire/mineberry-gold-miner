@@ -14,5 +14,7 @@ Tell it:
 IMPORTANT!!
 - This will get you banned if too suspicious
 - Try to convert your money to items and spread it around the server
-1 billion a day
-  watch out
+- it earns 1 billion a day so watch out
+
+
+--> best items to convert to: elytras, maces, golden apples (stable prices), armour sets, netherite ingots, ancient debris
