@@ -1,0 +1,604 @@
+// pickaxe_mender.dscript  (private build) - run by happilyeverafter
+// Repairs the miners' worn Mending pickaxes with blaze XP, and empties the emerald chest's junk into the
+// community chests at /warp mine.
+//
+// Every round:
+//   /home -> mended pickaxes into the pickaxe chest -> junk from the emerald chest to /warp mine (community
+//   chests, the next one when one is full) -> /home -> take 4 worn pickaxes from the emerald chest
+//   -> /warp blaze67 -> walk to the kill spot facing the 1x1 hole -> KillAura hits blazes with the sword,
+//   a worn pickaxe in the offhand soaks up the XP; when it's full the next one goes in the offhand
+//   -> each pickaxe goes home as soon as it is mended (the miners wait for it) -> again.
+// The emerald itself, emeralds and pickaxes never leave the emerald chest as junk.
+//
+// Needs: a sword in the inventory, golden carrots in the carrot chest. The pickaxes must have Mending.
+// Run:  .scripts run pickaxe_mender    Stop: .scripts stop pickaxe_mender
+
+const HOME_COMMAND = "/home";
+const FARM_WARP    = "/warp blaze67";
+const MINE_WARP    = "/warp mine";
+const SPOT_X = 10473;           // the block to stand in (F3 at the farm: 10473 -12 13712, facing south)
+const SPOT_Y = -12;
+const SPOT_Z = 13712;
+const LOOK_X = 10473.47;        // the 1x1 hole the blazes come down: 3 blocks ahead, yaw 1.1, pitch -19.2
+const LOOK_Y = -9.28;
+const LOOK_Z = 13715.27;
+const CARRY        = 4;         // worn pickaxes carried to the farm; each one goes home as soon as it is mended
+const WORTH_FIXING = 100;       // take a pickaxe from the emerald chest only if it's missing at least this many uses
+const LOW_HEALTH   = 10;        // at the farm: below this, eat; below half of it after eating -> go home
+const CHEST_RADIUS = 4;         // chests above /home
+const MINE_RADIUS  = 12;        // community chests around the /warp mine landing (33 chests, 5+ blocks away)
+const JUNK_TRIPS   = 5;         // most trips to /warp mine per round (the emerald chest is a double chest)
+const OFFHAND      = 45;        // the offhand slot in your own inventory (no GUI open)
+
+// KillAura while at the farm: blazes only, straight ahead, normal reach. Put back when leaving or stopping.
+// "Packet": the alt's window isn't focused, so its pause menu is open, and "Real Input" (a simulated click) never fires with a menu up
+// The blazes sit behind the farm's blocks: it only hits with Through Walls on (fov 30 / range 3.5 / no walls hit nothing)
+const AURA_FARM    = [["entities", "minecraft:blaze"], ["fov", "180"], ["range", "6.0"], ["walls-range", "6.0"], ["attack-mode", "Packet"]];
+const AURA_USUAL   = [["entities", "minecraft:player|minecraft:blaze"], ["fov", "180"], ["range", "6.0"], ["walls-range", "0.0"], ["attack-mode", "Real Input"]];
+
+const GEM_COMMAND  = "/getgem";
+const GEM_EVERY    = 3600000;   // try at most once an hour (ms); the server refuses it until the next day
+
+let chestList = [];
+let chestRoles = [];
+let lastGem = 0;
+let mended = 0;
+let junkMoved = 0;
+
+function main() {
+    goHome();
+    emptyInventory();                           // leftovers from mining (raw gold, bucket, a good pickaxe) back in their chests
+    if (!hasSword()) {
+        dashboard("state", "waiting for a sword");
+        print("No sword yet - waiting for one to be dropped (pick it up by standing still)");
+        while (!hasSword()) { waitSeconds(2); }
+        print("Got a sword: " + swordName());
+    }
+    while (true) {
+        if (!hasSword()) {
+            dashboard("state", "waiting for a sword");
+            print("No sword (worn out or lost) - waiting for one to be dropped (pick it up by standing still)");
+            goHome();
+            while (!hasSword()) { waitSeconds(2); }
+            print("Got a sword: " + swordName());
+        }
+        goHome();
+        atHome();
+        if (wornCount() == 0) {
+            dashboard("state", "at home (no worn pickaxes - checking again in 5 min)");
+            print("No worn pickaxes to mend - checking again in 5 minutes");
+            waitSeconds(300);
+            continue;
+        }
+        farm();
+    }
+}
+
+// ---------------------------------------------------------------- at home
+
+function goHome() {
+    auraOff();
+    stopBaritone();
+    closeGui();
+    if (abs(x() - (-4203)) < 6 && abs(z() - 13561) < 6 && len(findBlocks("chest", CHEST_RADIUS)) > 0) { return; }   // already home: no /home every 5 minutes
+    // after a reconnect it stands at the world spawn (the lobby): /home does nothing there, /s1 comes first
+    if (abs(x()) < 64 && abs(z()) < 64) {
+        print("At the world spawn - going to s1 first");
+        command("/s1");
+        waitSeconds(12);
+    }
+    let fx = x(); let fz = z();
+    let t0 = time();
+    command(HOME_COMMAND);
+    let lastSent = time();
+    let resends = 0;
+    // no /home warm-up on Mineberry (~0.3 s): go on the moment it has moved; if the server ignored it, ask again
+    while (abs(x() - fx) + abs(z() - fz) < 60 && time() - t0 < 12000) {
+        if (time() - lastSent > 1200 && resends < 8) { resends = resends + 1; command(HOME_COMMAND); lastSent = time(); }
+        wait(1);
+    }
+    let tries = 0;
+    while (len(findBlocks("chest", CHEST_RADIUS)) == 0 && tries < 15) { waitSeconds(1); tries = tries + 1; }
+}
+
+// /getgem gives one emerald a day: it goes into the emerald chest (never to /warp mine)
+function claimGem() {
+    if (lastGem != 0 && time() - lastGem < GEM_EVERY) { return; }
+    lastGem = time();
+    let before = count("emerald");
+    command(GEM_COMMAND);
+    waitSeconds(3);
+    closeGui();
+    if (count("emerald") > before) { print("Got the daily emerald from " + GEM_COMMAND); }
+}
+
+// with the emerald chest open: emeralds in the inventory go in
+function depositGems() {
+    let items = inventoryItems();
+    let i = 0;
+    while (i < 36) {
+        if (items[i] == "emerald") { clickInventory(i + 1, 0, true); wait(2); }
+        i = i + 1;
+    }
+}
+
+function atHome() {
+    claimGem();
+    dashboard("state", "at home (putting away mended pickaxes)");
+    findChests();
+    closeGui();
+    if (slotItem(OFFHAND) != null) { fromOffhand(); }
+
+    // mended pickaxes -> the pickaxe chest; carrots; learn which chest is which
+    let i = 0;
+    while (i < len(chestList)) {
+        if (openChest(chestList[i])) {
+            let role = chestRole();
+            if (role == "empty" && (chestRoles[i] == "pickaxes" || isPickaxeChest(chestList[i]))) { role = "pickaxes"; }   // the pickaxe chest, emptied by the miners
+            chestRoles[i] = role;
+            if (role == "pickaxes") { depositMended(); }
+            if (role == "carrots" && count("golden_carrot") < 32) { withdraw("golden_carrot", 64 - count("golden_carrot")); wait(3); }
+            closeGui();
+            wait(4);
+        }
+        i = i + 1;
+    }
+    if (!contains(chestRoles, "pickaxes") && mendedCount() > 0) { depositInEmptyChest(); }
+    putInHotbar("golden_carrot");
+
+    // the emerald chest's junk -> the community chests at /warp mine
+    let trips = 0;
+    while (trips < JUNK_TRIPS) {
+        dashboard("state", "at home (taking junk from the emerald chest)");
+        if (!visitJunkChest("take")) { break; }
+        if (!hasJunk()) { break; }
+        if (!dumpJunk()) { break; }
+        trips = trips + 1;
+    }
+    if (hasJunk()) { visitJunkChest("return"); }   // community chests full: it goes back where it was
+
+    // 4 worn pickaxes for the next round
+    dashboard("state", "at home (taking worn pickaxes)");
+    visitJunkChest("worn");
+    eatUntilFull();
+    print("Carrying " + wornCount() + " worn pickaxes, " + count("golden_carrot") + " golden carrots");
+}
+
+// Everything except the sword, golden carrots and worn pickaxes goes back into the chests at home:
+// raw gold -> gold chest, buckets -> bucket chest, good pickaxes -> pickaxe chest, the rest -> emerald chest.
+function emptyInventory() {
+    dashboard("state", "at home (emptying the inventory)");
+    findChests();
+    closeGui();
+    if (slotItem(OFFHAND) != null) { fromOffhand(); }
+    let i = 0;
+    while (i < len(chestList)) {
+        if (openChest(chestList[i])) {
+            let role = chestRole();
+            if (role == "empty" && isPickaxeChest(chestList[i])) { role = "pickaxes"; }
+            chestRoles[i] = role;
+            let items = inventoryItems();
+            let uses = inventoryUses();
+            let n = 0;
+            while (n < 36) {
+                let it = items[n];
+                let put = false;
+                if (it != null) {
+                    if (role == "gold" && it == "raw_gold") { put = true; }
+                    if (role == "buckets" && (it == "bucket" || it == "water_bucket")) { put = true; }
+                    if (role == "pickaxes" && isPickaxe(it) && maxUses(it) - uses[n] < WORTH_FIXING) { put = true; }
+                }
+                if (put) { clickInventory(n + 1, 0, true); wait(2); }
+                n = n + 1;
+            }
+            closeGui();
+            wait(4);
+        }
+        i = i + 1;
+    }
+    if (hasJunk()) { visitJunkChest("return"); }
+    print("Inventory emptied: " + freeSlots() + " free slots");
+}
+
+// open the emerald chest and: "take" junk out, "return" junk back in, or take "worn" pickaxes
+function visitJunkChest(what) {
+    let i = 0;
+    while (i < len(chestList)) {
+        if (chestRoles[i] == "junk" && openChest(chestList[i])) {
+            if (what == "take") { takeJunk(); }
+            if (what == "return") { depositJunk(); }
+            if (what == "worn") { depositGems(); takeWorn(); }
+            closeGui();
+            wait(4);
+            return true;
+        }
+        i = i + 1;
+    }
+    print("Couldn't open the emerald chest");
+    return false;
+}
+
+// with the pickaxe chest open: every fully mended pickaxe goes in
+function depositMended() {
+    let items = inventoryItems();
+    let uses = inventoryUses();
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && isPickaxe(items[i]) && uses[i] >= maxUses(items[i])) {
+            clickInventory(i + 1, 0, true);
+            wait(2);
+        }
+        i = i + 1;
+    }
+}
+
+function mendedCount() {
+    let items = inventoryItems();
+    let uses = inventoryUses();
+    let n = 0;
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && isPickaxe(items[i]) && uses[i] >= maxUses(items[i])) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// The miners took every pickaxe, so the pickaxe chest is empty and can't be told apart by its contents.
+// If exactly one chest at home is empty, that's it: the mended pickaxes go there.
+function depositInEmptyChest() {
+    let found = -1;
+    let empties = 0;
+    let i = 0;
+    while (i < len(chestRoles)) {
+        if (chestRoles[i] == "empty") { empties = empties + 1; found = i; }
+        i = i + 1;
+    }
+    if (empties != 1) {
+        print("No pickaxe chest found and " + empties + " empty chests at home - keeping the mended pickaxes");
+        return;
+    }
+    if (openChest(chestList[found])) {
+        print("Pickaxe chest is empty - putting " + mendedCount() + " mended pickaxes in the only empty chest");
+        depositMended();
+        chestRoles[found] = "pickaxes";
+        closeGui();
+        wait(4);
+    }
+}
+
+// with the emerald chest open: everything that isn't an emerald or a pickaxe, as much as fits (1 slot kept free)
+function takeJunk() {
+    let items = chestItems();
+    let i = 0;
+    while (i < len(items) && freeSlots() > 1) {
+        if (items[i] != null && items[i] != "emerald" && !isPickaxe(items[i])) {
+            clickSlot(i, 0, true);
+            wait(2);
+        }
+        i = i + 1;
+    }
+}
+
+// with the emerald chest open: the worn pickaxes, up to CARRY
+function takeWorn() {
+    let items = chestItems();
+    let uses = chestUses();
+    let i = 0;
+    while (i < len(items) && i < len(uses) && wornCount() < CARRY && freeSlots() > 0) {
+        if (items[i] != null && isPickaxe(items[i]) && uses[i] >= 0 && maxUses(items[i]) - uses[i] >= WORTH_FIXING) {
+            clickSlot(i, 0, true);
+            wait(3);
+        }
+        i = i + 1;
+    }
+}
+
+// /warp mine, junk into the community chests there (the next one in the cluster when one is full), /home.
+// Returns false when the chests there can't take it all.
+function dumpJunk() {
+    dashboard("state", "taking junk to the community chests");
+    command(MINE_WARP);
+    waitSeconds(6);
+    let chests = nearChests(MINE_RADIUS);       // the cluster is 5-8 blocks from the landing: walk up to each one
+    if (len(chests) == 0) { print("No community chests near /warp mine"); goHome(); return false; }
+    baritone("set allowBreak false");
+    baritone("set allowPlace false");
+    for (let c in chests) {
+        if (hasJunk()) {
+            approach(c);
+            if (openChest(c)) {
+                depositJunk();
+                closeGui();
+                wait(4);
+            }
+        }
+    }
+    baritone("set allowBreak true");
+    baritone("set allowPlace true");
+    let ok = !hasJunk();
+    if (ok) { junkMoved = junkMoved + 1; dashboard("junk trips", junkMoved); }
+    else {
+        print("The community chests are full - bringing the rest back");
+        dashboard("reason", "community chests at /warp mine are full");
+    }
+    goHome();
+    return ok;
+}
+
+// walk to about 2 blocks from chest c (on the same floor) when it's out of reach
+function approach(c) {
+    let dx = c[0] + 0.5 - x();
+    let dz = c[2] + 0.5 - z();
+    let d = sqrt(dx * dx + dz * dz);
+    if (d <= 3.5) { return; }
+    let k = (d - 2) / d;
+    goto(floor(x() + dx * k), floor(y()), floor(z() + dz * k));
+}
+
+// with any chest open: every junk item in the inventory goes in
+function depositJunk() {
+    let items = inventoryItems();
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && isJunk(items[i])) {
+            clickInventory(i + 1, 0, true);
+            wait(2);
+        }
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------- at the farm
+
+function farm() {
+    dashboard("state", "going to the blaze farm");
+    command(FARM_WARP);
+    waitSeconds(6);
+    baritone("set allowBreak false");           // never dig or build inside the farm on the way to the spot
+    baritone("set allowPlace false");
+    goto(SPOT_X, SPOT_Y, SPOT_Z);
+    baritone("set allowBreak true");
+    baritone("set allowPlace true");
+    if (!atSpot(1)) {
+        print("Couldn't reach the kill spot (at " + x() + " " + y() + " " + z() + ") - trying again from home");
+        return;
+    }
+    if (!nextWorn()) { return; }
+    selectSword();
+    lookAt(LOOK_X, LOOK_Y, LOOK_Z);
+    auraOn();
+    dashboard("state", "mending at the blaze farm");
+    while (true) {
+        if (food() <= 14 || health() < LOW_HEALTH) {
+            auraOff();
+            selectItem("golden_carrot");
+            eat();
+            selectSword();
+            lookAt(LOOK_X, LOOK_Y, LOOK_Z);
+            auraOn();
+            if (health() < LOW_HEALTH / 2) { print("Low health at the farm - going home"); return; }
+        }
+        if (slotItem(OFFHAND) == null || slotDurability(OFFHAND) >= slotMaxDurability(OFFHAND)) {
+            if (slotItem(OFFHAND) != null) {
+                mended = mended + 1;
+                dashboard("mended", mended);
+                print("Mended " + slotItem(OFFHAND) + " (" + mended + " so far) - taking it home now, the miners may be waiting");
+                fromOffhand();
+                auraOff();
+                return;                         // main() goes home: the mended pickaxe into the pickaxe chest, then back here
+            }
+            if (!nextWorn()) {
+                print("All " + CARRY + " pickaxes mended - taking them home");
+                return;
+            }
+            selectSword();
+            lookAt(LOOK_X, LOOK_Y, LOOK_Z);
+        }
+        dashboard("offhand", str(slotDurability(OFFHAND)) + "/" + str(slotMaxDurability(OFFHAND)) + ", " + wornCount() + " left");
+        if (!atSpot(2)) {
+            print("Pushed off the kill spot - going back");
+            auraOff();
+            goto(SPOT_X, SPOT_Y, SPOT_Z);
+            lookAt(LOOK_X, LOOK_Y, LOOK_Z);
+            auraOn();
+        }
+        waitSeconds(2);
+    }
+}
+
+function atSpot(slack) {
+    return abs(x() - (SPOT_X + 0.5)) <= slack && abs(z() - (SPOT_Z + 0.5)) <= slack;
+}
+
+// the most worn pickaxe from the inventory into the offhand (the full one there goes back to the inventory)
+function nextWorn() {
+    let items = inventoryItems();
+    let uses = inventoryUses();
+    let best = -1;
+    let bestMissing = 0;
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && isPickaxe(items[i]) && uses[i] >= 0) {
+            let missing = maxUses(items[i]) - uses[i];
+            if (missing > bestMissing) { best = i; bestMissing = missing; }
+        }
+        i = i + 1;
+    }
+    if (best < 0) { return false; }
+    auraOff();
+    closeGui();
+    clickInventory(best + 1, 0);                // pick up the worn pickaxe
+    wait(3);
+    clickSlot(OFFHAND, 0);                      // into the offhand, picking up what was there
+    wait(3);
+    clickInventory(best + 1, 0);                // the old offhand item goes where the worn one was
+    wait(3);
+    print("Mending " + slotItem(OFFHAND) + " (" + slotDurability(OFFHAND) + "/" + slotMaxDurability(OFFHAND) + ")");
+    auraOn();
+    return true;
+}
+
+// the offhand item back into the inventory
+function fromOffhand() {
+    let items = inventoryItems();
+    let i = 0;
+    while (i < 36 && items[i] != null) { i = i + 1; }
+    if (i >= 36) { return; }
+    clickSlot(OFFHAND, 0);
+    wait(3);
+    clickInventory(i + 1, 0);
+    wait(3);
+}
+
+// ---------------------------------------------------------------- helpers
+
+function auraOn() {
+    for (let s in AURA_FARM) { command(".setting kill-aura " + s[0] + " " + s[1]); }
+    command(".toggle kill-aura on");
+}
+
+function auraOff() {
+    command(".toggle kill-aura off");
+    for (let s in AURA_USUAL) { command(".setting kill-aura " + s[0] + " " + s[1]); }
+}
+
+function isPickaxe(item) { return endsWith(item, "_pickaxe"); }
+function isSword(item)   { return endsWith(item, "_sword"); }
+// never junk: anything the miners use (raw gold, buckets, carrots, pickaxes), swords, emeralds
+function isJunk(item) {
+    return !isPickaxe(item) && !isSword(item) && item != "golden_carrot" && item != "cooked_beef" && item != "emerald"
+        && item != "raw_gold" && item != "bucket" && item != "water_bucket";
+}
+
+function hasJunk() {
+    for (let it in inventoryItems()) {
+        if (it != null && isJunk(it)) { return true; }
+    }
+    return false;
+}
+
+function swordName() {
+    for (let it in inventoryItems()) {
+        if (it != null && isSword(it)) { return it; }
+    }
+    return "none";
+}
+
+function hasSword() {
+    for (let it in inventoryItems()) {
+        if (it != null && isSword(it)) { return true; }
+    }
+    return false;
+}
+
+function selectSword() {
+    let items = inventoryItems();
+    let i = 0;
+    while (i < 9) {
+        if (items[i] != null && isSword(items[i])) { selectSlot(i + 1); return; }
+        i = i + 1;
+    }
+    for (let it in items) {
+        if (it != null && isSword(it)) { putInHotbar(it); selectItem(it); return; }
+    }
+}
+
+function maxUses(item) {
+    if (item == "netherite_pickaxe") { return 2031; }
+    if (item == "diamond_pickaxe") { return 1561; }
+    if (item == "iron_pickaxe") { return 250; }
+    if (item == "golden_pickaxe") { return 32; }
+    if (item == "stone_pickaxe") { return 131; }
+    return 59;
+}
+
+// worn pickaxes carried, offhand included
+function wornCount() {
+    let items = inventoryItems();
+    let uses = inventoryUses();
+    let n = 0;
+    let i = 0;
+    while (i < 36) {
+        if (items[i] != null && isPickaxe(items[i]) && uses[i] >= 0 && uses[i] < maxUses(items[i])) { n = n + 1; }
+        i = i + 1;
+    }
+    let off = slotItem(OFFHAND);
+    if (off != null && isPickaxe(off) && slotDurability(OFFHAND) < slotMaxDurability(OFFHAND)) { n = n + 1; }
+    return n;
+}
+
+// chests within r blocks, closest first, a double chest once
+function nearChests(r) {
+    let out = [];
+    for (let c in findBlocks("chest", r)) {
+        let half = false;
+        for (let k in out) {
+            if (k[1] == c[1] && abs(k[0] - c[0]) + abs(k[2] - c[2]) == 1) { half = true; }
+        }
+        if (!half) { push(out, c); }
+    }
+    return out;
+}
+
+function findChests() {
+    if (len(chestList) > 0) { return; }
+    for (let c in nearChests(CHEST_RADIUS)) { push(chestList, c); if (isPickaxeChest(c)) { push(chestRoles, "pickaxes"); } else { push(chestRoles, ""); } }
+    if (len(chestList) == 0) { error("No chest within " + CHEST_RADIUS + " blocks of home"); }
+}
+
+function chestRole() {
+    let items = chestItems();
+    if (contains(items, "emerald")) { return "junk"; }
+    if (contains(items, "glass_pane")) { return "pickaxes"; }   // the glass pane marks the pickaxe chest (it never leaves it)
+    for (let it in items) {
+        if (it != null && contains(it, "pickaxe")) { return "pickaxes"; }
+    }
+    if (contains(items, "golden_carrot")) { return "carrots"; }
+    if (contains(items, "water_bucket") || contains(items, "bucket")) { return "buckets"; }
+    if (contains(items, "raw_gold")) { return "gold"; }
+    for (let it in items) {
+        if (it != null) { return ""; }
+    }
+    return "empty";
+}
+
+function openChest(c) {
+    if (openBlock(c[0], c[1], c[2])) { wait(6); return true; }
+    wait(10);
+    if (openBlock(c[0], c[1], c[2])) { wait(6); return true; }
+    return false;
+}
+
+// move item into the hotbar (swapping with a slot that isn't the sword or the carrots)
+function putInHotbar(item) {
+    let inv = inventoryItems();
+    let i = 0;
+    while (i < 9) {
+        if (inv[i] == item) { return; }
+        i = i + 1;
+    }
+    let from = 9;
+    while (from < 36 && inv[from] != item) { from = from + 1; }
+    if (from >= 36) { return; }
+    let to = 8;
+    while (to >= 0 && inv[to] != null && (isSword(inv[to]) || inv[to] == "golden_carrot")) { to = to - 1; }
+    if (to < 0) { return; }
+    clickInventory(from + 1, 0);
+    wait(2);
+    clickInventory(to + 1, 0);
+    wait(2);
+    clickInventory(from + 1, 0);
+    wait(2);
+}
+
+function onStop() {
+    command(".toggle kill-aura off");
+    for (let s in AURA_USUAL) { command(".setting kill-aura " + s[0] + " " + s[1]); }
+    baritone("set allowBreak true");
+    baritone("set allowPlace true");
+    stopBaritone();
+}
+
+// The pickaxe chest is the double chest at -4204/-4203, 27, 13562. Empty, nothing else marks it, so its place does.
+function isPickaxeChest(c) { return c[1] == 27 && c[2] == 13562 && (c[0] == -4204 || c[0] == -4203); }
