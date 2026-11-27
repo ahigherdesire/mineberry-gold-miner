@@ -17,6 +17,6 @@ IMPORTANT!!
 - it earns 1 billion a day so watch out
 
 
---> best items to convert to: elytras, maces, golden apples (stable prices), armour sets, netherite ingots, ancient debris
+--> best items to convert to: elytras, maces, golden apples (stable prices), armour sets, netherite ingots, ancient debris, totems (also pretty stable)
 --> or gamble them away, idk
 
