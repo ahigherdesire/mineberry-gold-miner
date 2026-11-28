@@ -1,4 +1,3 @@
-
 # DIH Client — Automated Gold Mining System
 
 An automated Minecraft gold-mining and pickaxe-maintenance system powered by the DIH Client.
@@ -62,7 +61,7 @@ Ensure that all supply chests are within interaction range without requiring the
 | Pickaxe Supply | Fresh or repaired pickaxes | Glass pane in the first slot |
 | Maintenance & Junk | Worn pickaxes and unwanted items | Emerald in the first slot |
 | Food Supply | Cooked beef or golden carrots | As configured in the script |
-| Water Bucket Supply | Water buckets | As configured in the script |
+| Bucket Supply | Empty buckets only | Contains ordinary empty buckets |
 | Raw Gold Supply | Approximately 128 raw gold | As configured in the script |
 
 > [!IMPORTANT]
@@ -70,15 +69,19 @@ Ensure that all supply chests are within interaction range without requiring the
 
 Do not remove or replace the identification items while the scripts are running.
 
-### Water Bucket Supply
+### Bucket Supply & 2×2 Infinite Water Pool
 
-Water buckets are used for emergency MLG water-bucket landings.
+You only need **one bucket supply chest stocked with empty buckets**. There is no need to manually stock it with filled water buckets.
 
-The water bucket chest may require frequent replenishment.
+1. Place the bucket chest within interaction range of the bots' `/home`.
+2. Build a separate 2×2, one-block-deep water pool near `/home`.
+3. Place water source blocks in two diagonally opposite corners and allow all four blocks to become water sources.
+4. Ensure the bots can reach and interact with the water without moving from `/home`. Keep the line of sight unobstructed.
 
-For a more sustainable system, construct a 2×2 infinite water source and modify the script to refill empty buckets automatically.
+The script already supports automatic bucket refilling. When a miner needs a water bucket, it takes an empty bucket from the chest, fills it from the pool, and returns any excess empty buckets to the bucket chest.
 
-Refer to the DIH scripting documentation when implementing this modification.
+> [!IMPORTANT]
+> Keep the infinite water pool separate from the gold collection stream. Replenish empty buckets if they are lost. No script modification is required for automatic water refilling.
 
 ---
 
@@ -90,7 +93,7 @@ The gold miner is responsible for locating, mining and delivering raw gold to yo
 
 When the script starts, the bot collects:
 
-- A water bucket for emergency landings.
+- A water bucket for emergency landings, automatically filled from the 2×2 pool if needed.
 - A pickaxe.
 - Food for healing and hunger management.
 - Raw gold to fill the required inventory slots.
@@ -213,7 +216,8 @@ Before leaving the operation unattended, verify the following:
 - [ ] Sufficient pickaxes are available.
 - [ ] Pickaxes have the Mending enchantment.
 - [ ] Food supplies are stocked.
-- [ ] Water buckets are stocked.
+- [ ] One bucket supply chest is stocked with empty buckets.
+- [ ] A separate 2×2 infinite water pool is within reach and has an unobstructed interaction path.
 - [ ] Approximately 128 raw gold is available in the raw gold supply chest.
 - [ ] The maintenance bot has a suitable sword.
 - [ ] All required teleportation commands work.
@@ -305,7 +309,8 @@ Although the system is automated, it still requires occasional supervision.
 
 ### Regular Checks
 
-- Replenish food and water buckets.
+- Replenish food and empty buckets when needed.
+- Check that the 2×2 infinite water pool remains intact and accessible.
 - Verify that pickaxes are being repaired and redistributed.
 - Check for full chests or blocked hoppers.
 - Ensure that all bots are still connected.
